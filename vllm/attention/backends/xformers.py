@@ -679,17 +679,17 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 block_indices = block_tables[i, :num_ctx_blocks]
 
                 # key_cache layout: [blocks, kv_heads, head_size//x, block_size, x]
-                # permute to:       [blocks, kv_heads, block_size, head_size//x, x]
+                # permute to:       [blocks, block_size, kv_heads, head_size//x, x]
                 # reshape to:       [blocks * block_size, kv_heads, head_size]
                 k_cached = key_cache[block_indices]
-                k_cached = k_cached.permute(0, 1, 3, 2, 4).reshape(
+                k_cached = k_cached.permute(0, 3, 1, 2, 4).reshape(
                     -1, self.num_kv_heads, self.head_size)[:context_len]
 
                 # value_cache layout: [blocks, kv_heads, head_size, block_size]
-                # permute to:         [blocks, kv_heads, block_size, head_size]
+                # permute to:         [blocks, block_size, kv_heads, head_size]
                 # reshape to:         [blocks * block_size, kv_heads, head_size]
                 v_cached = value_cache[block_indices]
-                v_cached = v_cached.permute(0, 1, 3, 2).reshape(
+                v_cached = v_cached.permute(0, 3, 1, 2).reshape(
                     -1, self.num_kv_heads, self.head_size)[:context_len]
 
                 all_keys.append(torch.cat([k_cached, k_new], dim=0))
