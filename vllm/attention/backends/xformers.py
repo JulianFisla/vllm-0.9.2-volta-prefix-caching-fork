@@ -8,6 +8,7 @@ import torch
 from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (AttentionBias,
                                          BlockDiagonalCausalMask,
+                                         BlockDiagonalCausalFromBottomRightMask,
                                          BlockDiagonalMask,
                                          LowerTriangularMaskWithTensorBias)
 
@@ -355,11 +356,11 @@ class XFormersMetadataBuilder(CommonMetadataBuilder[XFormersMetadata]):
 class XFormersImpl(AttentionImpl[XFormersMetadata]):
     """
     If the input tensors contain prompt tokens, the layout is as follows:
-    |<--------------- num_prefill_tokens ----------------->|	
+    |<--------------- num_prefill_tokens ----------------->|
     |<--prefill_0-->|<--prefill_1-->|...|<--prefill_N-1--->|
 
-    Otherwise, the layout is as follows:	
-    |<----------------- num_decode_tokens ------------------>|	
+    Otherwise, the layout is as follows:
+    |<----------------- num_decode_tokens ------------------>|
     |<--decode_0-->|..........|<--decode_M-1-->|<--padding-->|
 
     Generation tokens can contain padding when cuda-graph is used.
@@ -565,7 +566,11 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
         if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.
-            if kv_cache.numel() == 0 or prefill_meta.block_tables.numel() == 0:
+            has_cached_context = (
+                prefill_meta.context_lens_tensor is not None
+                and prefill_meta.context_lens_tensor.any()
+            )
+            if kv_cache.numel() == 0 or prefill_meta.block_tables.numel() == 0 or not has_cached_context:
                 # normal attention.
                 # block tables are empty if the prompt does not have a cached
                 # prefix.
@@ -580,25 +585,15 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 assert prefill_meta.query_start_loc is not None
                 assert prefill_meta.max_query_len is not None
 
-                # prefix-enabled attention
-                # TODO(Hai) this triton kernel has regression issue (broke) to
-                # deal with different data types between KV and FP8 KV cache,
-                # to be addressed separately.
-                out = PagedAttention.forward_prefix(
+                # Volta-compatible prefix attention using xformers
+                # instead of the Triton kernel that crashes on SM < 8.0
+                out = self._volta_forward_prefix(
                     query,
                     key,
                     value,
-                    self.kv_cache_dtype,
                     key_cache,
                     value_cache,
-                    prefill_meta.block_tables,
-                    prefill_meta.query_start_loc,
-                    prefill_meta.seq_lens_tensor,
-                    prefill_meta.max_query_len,
-                    self.alibi_slopes,
-                    self.sliding_window,
-                    layer._k_scale,
-                    layer._v_scale,
+                    prefill_meta,
                 )
                 assert output[:num_prefill_query_tokens].shape == out.shape
                 output[:num_prefill_query_tokens] = out
@@ -630,6 +625,109 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
+
+    def _volta_forward_prefix(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        prefill_meta: "XFormersMetadata",
+    ) -> torch.Tensor:
+        """
+        Volta-compatible replacement for context_attention_fwd.
+        Gathers cached KV from paged cache blocks, concatenates with
+        new KV, and runs xformers attention with a bottom-right
+        causal mask. This avoids the Triton prefix_prefill kernel
+        which crashes on Volta (SM 7.0) due to MMA layout issues.
+        """
+        if self.alibi_slopes is not None:
+            raise NotImplementedError(
+                "Volta prefix attention does not support ALiBi slopes")
+        if self.sliding_window is not None:
+            logger.warning_once(
+                "Volta prefix attention fallback does not support "
+                "sliding window. Results may be incorrect.")
+
+        block_size = value_cache.shape[3]
+        query_start_loc = prefill_meta.query_start_loc
+        seq_lens = prefill_meta.seq_lens_tensor
+        block_tables = prefill_meta.block_tables
+        num_seqs = seq_lens.shape[0]
+
+        q_seqlens = []
+        kv_seqlens = []
+        all_keys = []
+        all_values = []
+
+        for i in range(num_seqs):
+            q_start = query_start_loc[i].item()
+            q_end = query_start_loc[i + 1].item()
+            query_len = q_end - q_start
+            seq_len = seq_lens[i].item()
+            context_len = seq_len - query_len
+
+            q_seqlens.append(query_len)
+            kv_seqlens.append(seq_len)
+
+            k_new = key[q_start:q_end]
+            v_new = value[q_start:q_end]
+
+            if context_len > 0:
+                num_ctx_blocks = (context_len + block_size - 1) // block_size
+                block_indices = block_tables[i, :num_ctx_blocks]
+
+                # key_cache layout: [blocks, kv_heads, head_size//x, block_size, x]
+                # permute to:       [blocks, kv_heads, block_size, head_size//x, x]
+                # reshape to:       [blocks * block_size, kv_heads, head_size]
+                k_cached = key_cache[block_indices]
+                k_cached = k_cached.permute(0, 1, 3, 2, 4).reshape(
+                    -1, self.num_kv_heads, self.head_size)[:context_len]
+
+                # value_cache layout: [blocks, kv_heads, head_size, block_size]
+                # permute to:         [blocks, kv_heads, block_size, head_size]
+                # reshape to:         [blocks * block_size, kv_heads, head_size]
+                v_cached = value_cache[block_indices]
+                v_cached = v_cached.permute(0, 1, 3, 2).reshape(
+                    -1, self.num_kv_heads, self.head_size)[:context_len]
+
+                all_keys.append(torch.cat([k_cached, k_new], dim=0))
+                all_values.append(torch.cat([v_cached, v_new], dim=0))
+            else:
+                all_keys.append(k_new)
+                all_values.append(v_new)
+
+        full_key = torch.cat(all_keys, dim=0)
+        full_value = torch.cat(all_values, dim=0)
+
+        original_query = query
+        if self.num_kv_heads != self.num_heads:
+            query = query.view(query.shape[0], self.num_kv_heads,
+                               self.num_queries_per_kv, query.shape[-1])
+            full_key = full_key[:, :, None, :].expand(
+                full_key.shape[0], self.num_kv_heads,
+                self.num_queries_per_kv, full_key.shape[-1])
+            full_value = full_value[:, :, None, :].expand(
+                full_value.shape[0], self.num_kv_heads,
+                self.num_queries_per_kv, full_value.shape[-1])
+
+        attn_bias = BlockDiagonalCausalFromBottomRightMask.from_seqlens(
+            q_seqlen=q_seqlens,
+            kv_seqlen=kv_seqlens,
+            device=query.device,
+        )
+
+        out = xops.memory_efficient_attention_forward(
+            query.unsqueeze(0),
+            full_key.unsqueeze(0),
+            full_value.unsqueeze(0),
+            attn_bias=attn_bias,
+            p=0.0,
+            scale=self.scale,
+        )
+
+        return out.view_as(original_query)
 
     def _run_memory_efficient_xformers_forward(
         self,
